@@ -1,0 +1,63 @@
+name: Auto-bump from npm
+
+# Self-contained bump: polls the npm registry for the latest
+# @solidnumber/cli and updates bucket/solid.json when it drifts.
+# Runs on the built-in GITHUB_TOKEN — no PAT, no cross-repo secret,
+# nothing that can silently expire. This is the guaranteed catch-all;
+# solid-cli's scoop-bump.yml is the optional instant fast path.
+
+on:
+  schedule:
+    - cron: "23 */4 * * *" # every 4 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare npm latest vs manifest
+        id: check
+        run: |
+          LATEST="$(curl -fsSL https://registry.npmjs.org/@solidnumber/cli/latest | jq -r .version)"
+          CURRENT="$(jq -r .version bucket/solid.json)"
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "could not read latest version from npm registry"
+            exit 1
+          fi
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "manifest already at $CURRENT — nothing to do"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump needed: $CURRENT -> $LATEST"
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump manifest
+        if: steps.check.outputs.bump == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.latest }}"
+          curl -fsSL "https://registry.npmjs.org/@solidnumber/cli/-/cli-${VERSION}.tgz" -o /tmp/cli.tgz
+          # Never hash an empty/partial file — a wrong hash ships a
+          # checksum-mismatch to every scoop user.
+          if [ ! -s /tmp/cli.tgz ]; then
+            echo "empty tarball download — refusing to hash"
+            exit 1
+          fi
+          SHA="$(sha256sum /tmp/cli.tgz | awk '{print $1}')"
+          jq --arg v "$VERSION" --arg s "$SHA" \
+            '.version = $v
+             | .url = ("https://registry.npmjs.org/@solidnumber/cli/-/cli-" + $v + ".tgz")
+             | .hash = ("sha256:" + $s)' \
+            bucket/solid.json > bucket/solid.json.new
+          mv bucket/solid.json.new bucket/solid.json
+          git config user.name  "solid-cli-bot"
+          git config user.email "bot@solidnumber.com"
+          git add bucket/solid.json
+          git commit -m "bump solid → ${VERSION} (auto)"
+          git push
